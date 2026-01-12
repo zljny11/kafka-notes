@@ -1,132 +1,293 @@
 # Kafka Notes
 
-## 核心概念
+## 目录
 
-| 概念 | 作用 | 核心特性 |
-|------|------|----------|
-| **Topic** | 消息分类 | 逻辑容器 |
-| **Partition** | 并行扩展 | 单分区有序，多分区并行 |
-| **Offset** | 位置追踪 | 唯一标识 + 消费进度 |
+- [一、架构概览](#一架构概览)
+- [二、核心概念](#二核心概念)
+  - [2.1 Topic](#21-topic)
+  - [2.2 Partition](#22-partition)
+  - [2.3 Offset](#23-offset)
+  - [2.4 Replication](#24-replication)
+- [三、生产机制](#三生产机制)
+  - [3.1 发送方式](#31-发送方式)
+  - [3.2 Message Key](#32-message-key)
+  - [3.3 消息结构](#33-消息结构)
+  - [3.4 序列化](#34-序列化)
+- [四、消费机制](#四消费机制)
+  - [4.1 消费模型](#41-消费模型)
+  - [4.2 消费者组](#42-消费者组)
+  - [4.3 Offset 管理](#43-offset-管理)
+  - [4.4 反序列化](#44-反序列化)
+- [五、投递语义](#五投递语义)
+- [六、核心配置](#六核心配置)
+- [七、架构关系图](#七架构关系图)
 
 ---
 
-### Topic & Partition & Offset
+## 一、架构概览
+
+**Kafka 是什么？**
+
+分布式消息队列系统，用于处理实时数据流。
+
+**核心架构**
 
 ```
-Topic: "orders"
+Producer → Broker Cluster → Consumer
+   ↑            ↑              ↑
+ 生产消息      存储消息       消费消息
+```
+
+**基本组件**
+
+| 组件 | 职责 |
+|------|------|
+| Producer | 生产消息，发送到 Broker |
+| Broker | 存储消息，处理读写请求 |
+| Consumer | 从 Broker 拉取并处理消息 |
+| ZooKeeper | 管理集群元数据（旧版本） |
+
+[↑ 返回目录](#目录)
+
+---
+
+## 二、核心概念
+
+### 2.1 Topic
+
+**定义**
+
+消息的逻辑分类容器，类似数据库中的表。
+
+**特性**
+
+- 命名具有业务含义（如 `orders`、`user-events`）
+- 一个 Topic 可包含多个 Partition
+- Producer/Consumer 通过 Topic 名称进行消息收发
+
+[↑ 返回目录](#目录)
+
+---
+
+### 2.2 Partition
+
+**定义**
+
+Topic 的物理分片，实现并行处理和扩展。
+
+**关键特性**
+
+| 特性 | 说明 |
+|------|------|
+| 单分区有序 | 同一分区内消息按顺序存储 |
+| 多分区并行 | 不同分区可并行处理 |
+| 负载均衡 | 分区分布在不同 Broker 上 |
+
+**分区示例**
+
+```
+Topic: "orders" (3个分区)
 ├── Partition 0  [Offset: 0,1,2,3...]
 ├── Partition 1  [Offset: 0,1,2,3...]
 └── Partition 2  [Offset: 0,1,2,3...]
-
-消费者数 ≤ 分区数 （一个分区只允许有一个消费者）
 ```
 
-**Partition**: 单个分区有序，跨分区无序
+**消费规则**
 
-**Offset**: 分区内唯一位置标识，从 0 开始
+消费者数量 ≤ 分区数量（一个分区同时只能被一个消费者消费）
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Producer
+### 2.3 Offset
 
-**发送方式**
-- Fire-and-forget: 发送不确认（可能丢数据）
-- Synchronous: 同步等待响应
-- Asynchronous: 异步回调
+**定义**
 
-**核心配置**
-```properties
-bootstrap.servers=localhost:9092
-key.serializer=StringSerializer
-value.serializer=StringSerializer
-acks=1  # 0/1/all
-retries=3
-```
+分区内消息的唯一位置标识，从 0 开始递增。
+
+**作用**
+
+- 标识消息在分区中的位置
+- 追踪消费者的消费进度
+- 支持消息回溯和重新消费
+
+**特性**
+
+- 分区独立，每个分区有独立的 Offset 序列
+- Consumer 通过 Offset 控制消费位置
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Message Key
+### 2.4 Replication
+
+**目的**
+
+数据冗余，保证高可用性。
+
+**核心概念**
+
+| 概念 | 说明 |
+|------|------|
+| Leader | 处理所有读写请求 |
+| Follower | 只从 Leader 同步数据，不处理客户端请求 |
+| ISR (In-Sync Replicas) | 与 Leader 保持同步的副本集合 |
+
+**分区分布示例**
 
 ```
-无 Key → 随机分区（负载均衡）
-有 Key → Hash(Key) % 分区数（固定分区，保序）
+Topic: "orders" (3 partitions, 2 replicas)
+
+Broker 1         Broker 2         Broker 3
+│                 │                 │
+├─ P0 (Leader)   ├─ P0 (Replica)  ├─ P1 (Leader)
+├─ P1 (Replica)  ├─ P2 (Leader)   ├─ P2 (Replica)
+└─ P2 (Replica)  └─ P1 (Replica)  └─ P0 (Replica)
 ```
 
-**何时用 Key？**
+[↑ 返回目录](#目录)
+
+---
+
+## 三、生产机制
+
+### 3.1 发送方式
+
+| 方式 | 特点 | 风险 |
+|------|------|------|
+| Fire-and-forget | 发送后不等待响应 | 可能丢失数据 |
+| Synchronous | 同步等待确认 | 吞吐量较低 |
+| Asynchronous | 异步回调处理 | 需处理失败情况 |
+
+**acks 参数（确认级别）**
+
+| 值 | 含义 | 可靠性 |
+|------|------|------|
+| 0 | 不等待确认 | 最低 |
+| 1 | Leader 确认即可 | 中等 |
+| all | 所有 ISR 副本确认 | 最高 |
+
+[↑ 返回目录](#目录)
+
+---
+
+### 3.2 Message Key
+
+**作用**
+
+决定消息路由到哪个分区。
+
+**路由规则**
+
+```
+无 Key → 随机选择分区（负载均衡）
+有 Key → Hash(Key) % 分区数（固定路由）
+```
+
+**Hash 算法**
+
+- 使用 Murmur2 算法
+- 相同 Key 永远路由到同一分区
+- **增加分区数会改变路由！**
+
+**使用场景**
 
 | 场景 | 需要 Key |
 |------|----------|
-| 日志收集 | ❌ |
-| 用户事件 | ✅ 同一用户需保序 |
-| 订单状态 | ✅ 同一订单需保序 |
+| 日志收集 | 否 |
+| 用户行为事件 | 是（同一用户保序） |
+| 订单状态变更 | 是（同一订单保序） |
 
-```java
-new ProducerRecord<>("orders", "order-123", "{\"status\":\"shipped\"}");
-//                    ↑Topic     ↑Key        ↑Value
-```
+[↑ 返回目录](#目录)
 
 ---
 
-### Serialization
+### 3.3 消息结构
 
-**对象 → 字节流**
+**生产者发送时**
 
-| 序列化器 | 适用场景 |
-|---------|----------|
-| StringSerializer | JSON、文本 |
-| ByteArraySerializer | 二进制 |
-| 自定义 JSON | 推荐（跨语言） |
-
----
-
-### Key Hashing（Murmur2 alg）
-
-```java
-partition = abs(murmur2(key)) % partitionCount
-```
-
-**增加分区数会改变路由！**
-
----
-
-### Message Structure
-
-**ProducerRecord（生产者发送时）**
 ```
 Topic + Key + Value + Headers
- ↑     ↑     ↑        ↑
-必填  可选  必填     可选
+ ↑      ↑     ↑        ↑
+必填   可选  必填     可选元数据
 ```
 
-**Broker 存储（追加 Offset 后）**
+**Broker 存储时**
+
 ```
 Offset + Key + Value + Headers
   ↑      ↑     ↑        ↑
 位置   路由  业务数据  元数据
 ```
 
-**Headers**: 追踪、版本控制等元数据（Kafka 0.11+）
+**Headers 用途**
+
+- 消息追踪（Trace ID）
+- 版本控制
+- 其他元数据（Kafka 0.11+ 支持）
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Consumer
+### 3.4 序列化
 
-**消费模型**
+**定义**
+
+将对象转换为字节流，便于网络传输和存储。
+
+**常用序列化器**
+
+| 序列化器 | 适用场景 |
+|---------|----------|
+| StringSerializer | JSON、文本数据 |
+| ByteArraySerializer | 二进制数据 |
+| 自定义 JSON 序列化器 | 跨语言场景（推荐） |
+
+**注意**
+
+- Producer 的 Serializer 与 Consumer 的 Deserializer 必须匹配
+- 同一个 Topic 的序列化格式不可改变
+
+[↑ 返回目录](#目录)
+
+---
+
+## 四、消费机制
+
+### 4.1 消费模型
+
+**基本流程**
+
 ```
-Consumer → poll() → 批量拉取消息 → 处理 → 提交 Offset
+Consumer → poll() → 批量拉取 → 处理消息 → 提交 Offset
 ```
 
-**核心配置**
-```properties
-bootstrap.servers=localhost:9092
-key.deserializer=StringDeserializer
-value.deserializer=StringDeserializer
-group.id=my-group
-auto.offset.reset=earliest  # earliest/latest/none
-enable.auto.commit=false    # 手动提交更安全
-```
+**特点**
 
-**消费者组（Consumer Group）**
+- 主动拉取模式（Pull-based）
+- 批量拉取提高效率
+- 需要手动控制消费进度
+
+[↑ 返回目录](#目录)
+
+---
+
+### 4.2 消费者组
+
+**定义**
+
+多个消费者组成的逻辑组，共同消费一个 Topic。
+
+**消费规则**
+
+- 一个分区在同一时间只能被组内一个消费者消费
+- 不同消费者组互不影响，可独立消费同一 Topic
+
+**示例**
+
 ```
 Topic: "orders" (3 partitions)
 
@@ -139,100 +300,139 @@ Group B (1 consumer):
 └── C1 → Partition 0,1,2 (消费所有分区)
 ```
 
+**作用**
 
-**消费者组作用**
 - **负载均衡**：多消费者并行处理
-- **容错**：消费者挂掉，分区重新分配
-- **独立消费**：不同组互不影响
+- **容错**：消费者挂掉时自动重新分配分区
+- **独立消费**：不同组可各自处理相同消息
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Consumer Offset
+### 4.3 Offset 管理
 
-**Offset 存储位置**
-```
-__consumer_offsets topic (内部 topic)
-├── Key: group.id + topic + partition
-└── Value: offset + metadata
-```
+**存储位置**
 
-**Offset 提交策略**
+存储在内部 Topic `__consumer_offsets` 中：
+- Key: `group.id + topic + partition`
+- Value: `offset + metadata`
+
+**提交策略**
 
 | 策略 | 优点 | 缺点 |
 |------|------|------|
-| 自动提交 | 简单 | 可能重复消费或丢失 |
-| 手动同步 | 精确控制 | 阻塞，吞吐低 |
-| 手动异步 | 高吞吐 | 可能提交失败 |
+| 自动提交 | 简单易用 | 可能重复消费或丢失 |
+| 手动同步提交 | 精确控制 | 阻塞处理，吞吐量低 |
+| 手动异步提交 | 高吞吐量 | 可能提交失败 |
+
+**auto.offset.reset 参数**
+
+| 值 | 行为 | 场景 |
+|------|------|------|
+| earliest | 从最早的消息开始 | 新消费者组 |
+| latest | 从最新的消息开始 | 默认值 |
+| none | 报错 | 必须已有 Offset |
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Delivery Semantics（投递语义）
+### 4.4 反序列化
+
+**定义**
+
+将字节流转换为对象，与序列化过程相反。
+
+**要求**
+
+- 必须与 Producer 的序列化格式一致
+- 使用对应的 Deserializer
+
+**常用反序列化器**
+
+| 反序列化器 | 对应序列化器 |
+|-----------|-------------|
+| StringDeserializer | StringSerializer |
+| ByteArrayDeserializer | ByteArraySerializer |
+
+[↑ 返回目录](#目录)
+
+---
+
+## 五、投递语义
 
 | 语义 | 提交时机 | 风险 | 适用场景 |
 |------|----------|------|----------|
-| **At most once** | 接收后立即提交 | 可能丢消息 | 允许丢失 |
-| **At least once** ✅ | 处理完成后提交 | 可能重复 | 推荐（需幂等） |
-| **Exactly once** | 事务 API | 复杂 | Kafka→Kafka 用 Streams |
+| At most once | 接收后立即提交 | 可能丢消息 | 允许数据丢失 |
+| At least once | 处理完成后提交 | 可能重复消费 | **推荐**（需幂等） |
+| Exactly once | 事务机制 | 实现复杂 | Kafka → Kafka 场景 |
 
-**At least once**（默认推荐）
-```java
-// 处理完成后提交，处理失败会重试
-while (true) {
-    ConsumerRecords<String, String> records = consumer.poll(Duration.ofMillis(100));
-    for (ConsumerRecord<String, String> record : records) {
-        process(record);  // 需幂等性
-    }
-    consumer.commitSync();
-}
-```
+**At least once（推荐）**
+
+- 处理完成后才提交 Offset
+- 处理失败会重试，确保至少处理一次
+- 需要业务层实现幂等性
 
 **At most once**
-```java
-// 接收后立即提交，处理失败则丢失
-consumer.commitSync();  // 先提交
-process(records);       // 后处理
-```
+
+- 接收后立即提交 Offset
+- 处理失败则丢失，不会重试
+- 适用于可容忍数据丢失的场景
 
 **Exactly once**
-- Kafka → Kafka: 使用 Transactional API / Kafka Streams
-- Kafka → 外部系统: 幂等消费者
 
-**auto.offset.reset**
-- `earliest`: 从最早开始（新组）
-- `latest`: 从最新开始（默认）
-- `none`: 报错（必须已有 offset）
+- Kafka → Kafka: 使用 Transactional API 或 Kafka Streams
+- Kafka → 外部系统: 需要幂等消费者
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Deserialization
+## 六、核心配置
 
-**字节流 → 对象**（与 Producer 序列化格式对应）
+**Producer 关键配置**
 
-**Producer/Consumer 序列化格式必须一致！**
+| 参数 | 作用 |
+|------|------|
+| bootstrap.servers | Broker 集群地址 |
+| key.serializer | Key 序列化器 |
+| value.serializer | Value 序列化器 |
+| acks | 确认级别（0/1/all） |
+| retries | 重试次数 |
 
-**同一个topic中serializer和deserializer的格式不可以改变！**
+**Consumer 关键配置**
 
-```java
-// Consumer 配置
-Properties props = new Properties();
-props.put("key.deserializer", "StringDeserializer");
-props.put("value.deserializer", "StringDeserializer");
+| 参数 | 作用 |
+|------|------|
+| bootstrap.servers | Broker 集群地址 |
+| key.deserializer | Key 反序列化器 |
+| value.deserializer | Value 反序列化器 |
+| group.id | 消费者组 ID |
+| auto.offset.reset | 初始 Offset 策略 |
+| enable.auto.commit | 是否自动提交 |
 
-Consumer<String, String> consumer = new KafkaConsumer<>(props);
-```
+**bootstrap.servers 说明**
+
+- 只需配置部分 Broker 地址
+- 客户端会自动发现集群中的所有 Broker
+- 建议配置多个以提高可用性
+
+[↑ 返回目录](#目录)
 
 ---
 
-### Broker & Cluster
+## 七、架构关系图
 
-**Kafka Client → Broker Cluster 关系**
+**完整数据流**
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                    Kafka Cluster                         │
 ├─────────────────────────────────────────────────────────┤
 │                                                           │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
-│  │ Broker 1 │  │ Broker 2 │  │ Broker 3 │  (3节点集群)  │
+│  │ Broker 1 │  │ Broker 2 │  │ Broker 3 │              │
 │  │ :9092    │  │ :9092    │  │ :9092    │              │
 │  └──────────┘  └──────────┘  └──────────┘              │
 │       │             │             │                      │
@@ -247,47 +447,28 @@ Consumer<String, String> consumer = new KafkaConsumer<>(props);
          │                                 │
     ┌─────────┐                      ┌─────────┐
     │Producer │                      │Consumer │
+    │         │                      │ Group   │
     └─────────┘                      └─────────┘
 ```
 
-**Broker 职责**
-- 接收 Producer 发送的消息
-- 存储分区数据（日志文件）
-- 响应 Consumer 拉取请求
-- 分区 Leader 选举
+**概念关系**
 
-**bootstrap.servers**
-```properties
-# 客户端连接配置（只需配置部分 Broker）
-bootstrap.servers=broker1:9092,broker2:9092,broker3:9092
+```
+Topic
+  ├─ Partition (并行扩展)
+  │   ├─ Offset (位置追踪)
+  │   └─ Leader/Follower (高可用)
+  └─ Replication (数据冗余)
 
-# 客户端会自动发现集群中的所有 Broker
+Producer
+  ├─ Message Key (路由策略)
+  ├─ Serialization (数据转换)
+  └─ acks (可靠性)
+
+Consumer
+  ├─ Consumer Group (负载均衡)
+  ├─ Offset 提交 (消费进度)
+  └─ Deserialization (数据还原)
 ```
 
-**Partition 分布**
-```
-Topic: "orders" (3 partitions, 2 replicas)
-
-Broker 1         Broker 2         Broker 3
-│                 │                 │
-├─ P0 (Leader)   ├─ P0 (Replica)  ├─ P1 (Leader)
-├─ P1 (Replica)  ├─ P2 (Leader)   ├─ P2 (Replica)
-└─ P2 (Replica)  └─ P1 (Replica)  └─ P0 (Replica)
-```
-
-**关键概念**
-- **Leader**: 处理读写请求
-- **Replica/Follower**: 只复制数据，不处理客户端请求
-- **ISR**: In-Sync Replicas（与 Leader 同步的副本集）
-
----
-
-### 总结
-
-| 概念 | 决策 |
-|------|------|
-| Producer | 同步/异步？重试？ |
-| Consumer | 手动/自动提交？ |
-| Key | 是否保序？ |
-| Serialization | JSON/Avro？ |
-| Hashing | 预估分区数，避免变更 |
+[↑ 返回目录](#目录)
